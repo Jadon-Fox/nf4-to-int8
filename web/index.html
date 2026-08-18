@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NF4 → INT8</title>
+  <style>
+    :root {
+      --bg: #0e1114; --fg: #e8ece8; --muted: #8b948c;
+      --line: #2a312c; --card: #161b18; --acc: #c4d45a; --warn: #e07a5f;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--fg);
+      font: 15px/1.5 "IBM Plex Sans", "Source Sans 3", system-ui, sans-serif; }
+    body { padding: 28px 20px 48px; }
+    main { max-width: 880px; margin: 0 auto; }
+    h1 { font: 600 28px/1.15 "IBM Plex Mono", ui-monospace, monospace; margin: 0 0 8px; letter-spacing: -0.03em; }
+    .lede { color: var(--muted); max-width: 58ch; margin: 0 0 24px; }
+    .warn { color: var(--warn); font-size: 13px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 700px) { .row { grid-template-columns: 1fr; } }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+    h2 { font: 600 13px/1.2 "IBM Plex Mono", ui-monospace, monospace; margin: 0 0 10px; color: var(--acc); letter-spacing: 0.04em; text-transform: uppercase; }
+    button { background: var(--acc); color: #14180c; border: 0; border-radius: 8px; padding: 10px 16px; font: 600 14px/1 inherit; cursor: pointer; }
+    button:hover { filter: brightness(1.05); }
+    pre, code { font: 12.5px/1.45 "IBM Plex Mono", ui-monospace, monospace; }
+    pre { margin: 0; overflow: auto; white-space: pre-wrap; color: #d5ddd0; }
+    table { width: 100%; border-collapse: collapse; font: 12px/1.4 "IBM Plex Mono", ui-monospace, monospace; }
+    td, th { text-align: left; padding: 3px 6px 3px 0; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 500; }
+    .hist { display: flex; align-items: flex-end; gap: 2px; height: 72px; margin-top: 10px; }
+    .hist i { flex: 1; background: var(--acc); opacity: 0.85; display: block; min-height: 1px; }
+    .meta { color: var(--muted); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>NF4 → INT8</h1>
+    <p class="lede">Dequant bitsandbytes / Unsloth NF4, then requant to symmetric INT8 (zp=0, per-block <code>amax/127</code>). Same 16-level codebook as the orch header.</p>
+    <p class="warn">Requant only. Not a train speedup. train_ok stays false.</p>
+    <p><button id="run" type="button">Convert demo tensor</button></p>
+    <div class="row">
+      <section class="card">
+        <h2>Codebook</h2>
+        <table id="cb"><thead><tr><th>idx</th><th>level</th></tr></thead><tbody></tbody></table>
+      </section>
+      <section class="card">
+        <h2>Result</h2>
+        <pre id="out">press convert</pre>
+        <div class="hist" id="hist" aria-hidden="true"></div>
+        <p class="meta" id="note"></p>
+      </section>
+    </div>
+  </main>
+  <script>
+    const CB = [-1.0,-0.6961928009986877,-0.5250730514526367,-0.39491748809814453,-0.28444138169288635,-0.18477343022823334,-0.09105003625154495,0.0,0.07958029955625534,0.16093020141124725,0.24611230194568634,0.33791524171829224,0.44070982933044434,0.5626170039176941,0.7229568362236023,1.0];
+    const tb = document.querySelector("#cb tbody");
+    CB.forEach((v,i) => { const tr = document.createElement("tr"); tr.innerHTML = `<td>${i}</td><td>${v}</td>`; tb.appendChild(tr); });
+
+    function nearest(v){ let b=0,d=Math.abs(v-CB[0]); for(let j=1;j<16;j++){const e=Math.abs(v-CB[j]); if(e<d){d=e;b=j;}} return b; }
+    function demoW(n){ const o=[]; for(let i=0;i<n;i++) o.push((((i*37)%200-100)/80)*(0.4+(i%17)/40)); return o; }
+    function quantNf4(w, bs){
+      const n=w.length, nb=Math.ceil(n/bs), am=new Array(nb).fill(0);
+      w.forEach((x,i)=>{ const a=Math.abs(x); if(a>am[Math.floor(i/bs)]) am[Math.floor(i/bs)]=a; });
+      const q=new Uint8Array(Math.ceil(n/2));
+      w.forEach((x,i)=>{
+        const s=am[Math.floor(i/bs)]; const idx=s===0?7:nearest(x/s);
+        const bi=i>>1, which=i&1, cur=q[bi];
+        let lo=cur&15, hi=cur>>4;
+        if(which===0) lo=idx; else hi=idx;
+        q[bi]=lo|(hi<<4);
+      });
+      return {q, am};
+    }
+    function deqNf4(q, am, n, bs){
+      const o=new Array(n);
+      for(let i=0;i<n;i++){ const b=q[i>>1]; const idx=(i&1)?((b>>4)&15):(b&15); o[i]=CB[idx]*am[Math.floor(i/bs)]; }
+      return o;
+    }
+    function quantI8(w, bs){
+      const n=w.length, nb=Math.ceil(n/bs), sc=new Array(nb).fill(0);
+      w.forEach((x,i)=>{ const a=Math.abs(x); if(a>sc[Math.floor(i/bs)]) sc[Math.floor(i/bs)]=a; });
+      for(let b=0;b<nb;b++) sc[b]=sc[b]>0?sc[b]/127:1;
+      const q=new Int8Array(n);
+      w.forEach((x,i)=>{ let v=Math.round(x/sc[Math.floor(i/bs)]); if(v>127)v=127; if(v<-127)v=-127; q[i]=v; });
+      return {q, sc};
+    }
+
+    document.getElementById("run").onclick = () => {
+      const w = demoW(256);
+      const nf = quantNf4(w, 64);
+      const f32 = deqNf4(nf.q, nf.am, 256, 64);
+      const i8 = quantI8(f32, 64);
+      let acc=0, mx=0;
+      for(let i=0;i<256;i++){ const r=i8.q[i]*i8.sc[Math.floor(i/64)]; const d=f32[i]-r; acc+=d*d; mx=Math.max(mx,Math.abs(d)); }
+      const rmse=Math.sqrt(acc/256);
+      document.getElementById("out").textContent =
+        `n=256  nf4_bs=64  i8_bs=64\n`+
+        `rmse vs NF4 dequant  ${rmse.toExponential(4)}\n`+
+        `max |err|            ${mx.toExponential(4)}\n`+
+        `int8[0..7]           ${Array.from(i8.q.slice(0,8)).join(", ")}\n`+
+        `scales               ${i8.sc.map(s=>s.toPrecision(4)).join(", ")}`;
+      const bins=new Array(16).fill(0);
+      i8.q.forEach(v => bins[Math.min(15, Math.floor((v+128)/16))]++);
+      const h=document.getElementById("hist"); h.innerHTML="";
+      const m=Math.max(...bins,1);
+      bins.forEach(c => { const i=document.createElement("i"); i.style.height=(c/m*72)+"px"; h.appendChild(i); });
+      document.getElementById("note").textContent = "INT8 histogram (signed bytes). train_ok=false";
+    };
+  </script>
+</body>
+</html>
