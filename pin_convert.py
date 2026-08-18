@@ -7,17 +7,18 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from nf4 import (
+    NF4_CODEBOOK,
     NIBBLE_LO_THEN_HI,
     decode_absmax,
     dequant_int8,
     dequant_nf4,
     max_abs_err,
-    n_absmax,
     pack_f32,
     quantize_int8_symmetric,
+    quantize_nf4,
     rmse,
     unpack_f32,
 )
@@ -70,7 +71,6 @@ def _stem_of_nf4_aux(name: str) -> Optional[str]:
 
 
 def group_modules(names: List[str]) -> Tuple[List[str], List[str], List[str]]:
-    """Return (nf4_stems, passthrough_names, consumed_aux)."""
     aux = {}
     for n in names:
         stem = _stem_of_nf4_aux(n)
@@ -99,7 +99,7 @@ def convert_nf4_module(
     stem: str,
     int8_blocksize: int,
     nibble_order: int = NIBBLE_LO_THEN_HI,
-) -> Tuple[bytes, List[float], dict, List[float]]:
+) -> Tuple[bytes, List[float], dict]:
     w_name = stem + ".weight"
     info = st.tensors[w_name]
     qweight = st.read_bytes(w_name)
@@ -111,12 +111,10 @@ def convert_nf4_module(
 
     shape = tuple(state.get("shape") or [])
     if len(shape) != 2:
-        # packed storage is often [out*in/2, 1]
         packed = 1
         for d in info.shape:
             packed *= int(d)
         n_elem = packed * 2
-        # last-resort: unknown 2d
         shape = (n_elem, 1)
     else:
         n_elem = int(shape[0]) * int(shape[1])
@@ -152,13 +150,6 @@ def convert_nf4_module(
     else:
         raise ValueError(f"{stem}: absmax dtype {abs_info.dtype} not supported")
 
-    qmap_name = stem + ".weight.quant_map"
-    # codebook is implicit in dequant_nf4 (SSOT). quant_map on disk is a check.
-    if qmap_name in st.tensors:
-        qmap = unpack_f32(st.read_bytes(qmap_name))
-        if len(qmap) != 16:
-            raise ValueError(f"{stem}: quant_map len {len(qmap)}")
-
     f32 = dequant_nf4(qweight, absmax, n_elem, blocksize, nibble_order)
     i8_bs = int8_blocksize if int8_blocksize > 0 else blocksize
     q8, scales = quantize_int8_symmetric(f32, blocksize=i8_bs)
@@ -176,7 +167,7 @@ def convert_nf4_module(
         "rmse_vs_nf4_dequant": rmse(f32, recon),
         "max_abs_err_vs_nf4_dequant": max_abs_err(f32, recon),
     }
-    return bytes(q8), scales, meta, f32
+    return bytes(q8), scales, meta
 
 
 def convert_pin(
@@ -215,7 +206,7 @@ def convert_pin(
         out_tensors: List[Tuple[str, str, Tuple[int, ...], bytes]] = []
         reports = []
         for stem in nf4_stems:
-            q8, scales, meta, _f32 = convert_nf4_module(st, stem, int8_blocksize)
+            q8, scales, meta = convert_nf4_module(st, stem, int8_blocksize)
             shape = tuple(meta["shape"])
             out_tensors.append((stem + ".weight", "I8", shape, q8))
             out_tensors.append(
@@ -269,7 +260,6 @@ def convert_pin(
         json.dumps({"pin": pin, "modules": reports}, indent=2) + "\n"
     )
 
-    # rewrite config quantization surface if present
     cfg_path = src_dir / "config.json"
     if cfg_path.is_file():
         try:
@@ -294,6 +284,48 @@ def convert_pin(
             shutil.copy2(src_f, out_dir / name)
 
     return {"pin": pin, "modules": reports}
+
+
+def write_tiny_fixture(out_dir: Path) -> dict:
+    """8×64 single-quant NF4 → INT8 pin. For the orch loader CI. Not Phi-4."""
+    from nf4_to_int8 import demo_weights
+
+    out_dir = out_dir.expanduser().resolve()
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    qw, am = quantize_nf4(w, blocksize=64)
+    state = json.dumps(
+        {
+            "quant_type": "nf4",
+            "blocksize": 64,
+            "dtype": "bfloat16",
+            "shape": [out_f, in_f],
+            "nested_blocksize": 256,
+            "nested_dtype": "float32",
+            "nested_offset": 0.0,
+        },
+        separators=(",", ":"),
+    ).encode()
+    src = out_dir / "_src"
+    src.mkdir(parents=True, exist_ok=True)
+    write_safetensors(
+        str(src / "model.safetensors"),
+        [
+            ("model.layers.0.mlp.down_proj.weight", "U8", (len(qw), 1), bytes(qw)),
+            ("model.layers.0.mlp.down_proj.weight.absmax", "F32", (len(am),), pack_f32(am)),
+            ("model.layers.0.mlp.down_proj.weight.quant_map", "F32", (16,), pack_f32(list(NF4_CODEBOOK))),
+            (
+                "model.layers.0.mlp.down_proj.weight.quant_state.bitsandbytes__nf4",
+                "U8",
+                (len(state),),
+                state,
+            ),
+            ("model.norm.weight", "BF16", (8,), b"\x00\x3c" * 8),
+        ],
+        metadata={"format": "pt"},
+    )
+    (src / "config.json").write_text(json.dumps({"model_type": "phi3", "hidden_size": 8}) + "\n")
+    return convert_pin(src, out_dir / "int8_pin", int8_blocksize=64)
 
 
 def cmd_pin(args: Any) -> int:

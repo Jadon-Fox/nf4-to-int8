@@ -172,6 +172,21 @@ def test_cli_pin_dry_run():
         assert "lin" in plan["nf4_modules"]
 
 
+def test_fixture_cli():
+    with tempfile.TemporaryDirectory() as td:
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "nf4_to_int8.py"), "fixture", "--out", td],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pin = json.loads(r.stdout)
+        assert pin["schema"] == "nf4_to_int8_pin_v1"
+        assert pin["train_ok"] is False
+        assert (Path(td) / "int8_pin" / "model.safetensors").is_file()
+        assert (Path(td) / "int8_pin" / "pin.json").is_file()
+
+
 def test_double_quant_module_pin():
     # encode L1 absmax through a fake 256-map so D1 decode is exact enough
     out_f, in_f = 4, 64
@@ -229,5 +244,6 @@ if __name__ == "__main__":
     test_double_quant_offset()
     test_pin_single_quant_roundtrip()
     test_cli_pin_dry_run()
+    test_fixture_cli()
     test_double_quant_module_pin()
     print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin double_quant cli NOT_train_ok")

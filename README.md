@@ -20,6 +20,8 @@ python3 nf4_to_int8.py pin \
   --out /path/to/Phi-4-mini-int8-pin
 
 python3 nf4_to_int8.py pin --src model.safetensors --out /tmp/pin --dry-run
+python3 nf4_to_int8.py fixture --out /tmp/tiny-pin   # 8×64 pin for orch loader CI
+
 ```
 
 `--src` is a HuggingFace snapshot dir or a single `.safetensors`.
