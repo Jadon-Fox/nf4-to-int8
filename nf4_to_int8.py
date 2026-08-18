@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Convert packed NF4 (bnb / Unsloth) to symmetric INT8.
+"""NF4 → INT8.
 
-This is dequant-then-requant. Not a free Tensor-Core win. Not train_ok.
+  # one-time model pin (Unsloth / bnb safetensors → INT8 pin dir)
+  python3 nf4_to_int8.py pin --src /path/to/bnb-4bit --out /path/to/int8-pin
 
-    python3 nf4_to_int8.py --demo
-    python3 nf4_to_int8.py --qweight w.nf4.bin --absmax w.absmax.f32.bin \\
-        --n-elem 4096 --blocksize 64 --out-prefix out/w
+  # single tensor
+  python3 nf4_to_int8.py --demo
+  python3 nf4_to_int8.py tensor --qweight w.nf4.bin --absmax w.absmax.f32.bin --n-elem 4096
+
+Offline pin. Not a dest-pack flip. Not train_ok.
 """
 from __future__ import annotations
 
@@ -67,7 +70,6 @@ def convert(
 
 
 def demo_weights(n: int = 256) -> list[float]:
-    # Deterministic mix so the demo is replayable.
     out = []
     for i in range(n):
         x = ((i * 37) % 200 - 100) / 80.0
@@ -75,19 +77,7 @@ def demo_weights(n: int = 256) -> list[float]:
     return out
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="NF4 → INT8 requant (bnb codebook)")
-    p.add_argument("--qweight", type=Path, help="packed NF4 bytes (2 nibbles / byte)")
-    p.add_argument("--absmax", type=Path, help="f32le absmax, one per NF4 block")
-    p.add_argument("--n-elem", type=int, help="logical element count")
-    p.add_argument("--blocksize", type=int, default=64, help="NF4 block size (64 or 128)")
-    p.add_argument("--int8-blocksize", type=int, default=0, help="INT8 block size (0 = same as NF4)")
-    p.add_argument("--nibble-order", choices=("lo_then_hi", "hi_then_lo"), default="lo_then_hi")
-    p.add_argument("--out-prefix", type=Path, default=Path("out/converted"))
-    p.add_argument("--demo", action="store_true", help="synthesize NF4 then convert")
-    p.add_argument("--json", action="store_true", help="print meta JSON to stdout")
-    args = p.parse_args(argv)
-
+def run_tensor(args: argparse.Namespace) -> int:
     nibble = NIBBLE_LO_THEN_HI if args.nibble_order == "lo_then_hi" else NIBBLE_HI_THEN_LO
     i8_bs = args.int8_blocksize if args.int8_blocksize > 0 else args.blocksize
 
@@ -99,7 +89,8 @@ def main(argv: list[str] | None = None) -> int:
         absmax = am
     else:
         if not args.qweight or not args.absmax or not args.n_elem:
-            p.error("need --qweight --absmax --n-elem, or --demo")
+            print("HARD_BLOCK: need --qweight --absmax --n-elem, or --demo", file=sys.stderr)
+            return 2
         qweight = args.qweight.read_bytes()
         absmax = unpack_f32(args.absmax.read_bytes())
         n_elem = args.n_elem
@@ -124,6 +115,49 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote {args.out_prefix}.i8.bin  {args.out_prefix}.scale.f32.bin  {args.out_prefix}.meta.json")
         print("requant only. train_ok=false")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    p = argparse.ArgumentParser(description="NF4 → INT8 (offline pin or single tensor)")
+    sub = p.add_subparsers(dest="cmd")
+
+    pin_p = sub.add_parser("pin", help="convert a bnb/Unsloth NF4 safetensors dir into an INT8 pin")
+    pin_p.add_argument("--src", required=True, help="model dir or model.safetensors")
+    pin_p.add_argument("--out", required=True, help="output pin directory")
+    pin_p.add_argument("--int8-blocksize", type=int, default=64)
+    pin_p.add_argument("--dry-run", action="store_true")
+
+    ten_p = sub.add_parser("tensor", help="convert one packed NF4 buffer")
+    ten_p.add_argument("--qweight", type=Path)
+    ten_p.add_argument("--absmax", type=Path)
+    ten_p.add_argument("--n-elem", type=int)
+    ten_p.add_argument("--blocksize", type=int, default=64)
+    ten_p.add_argument("--int8-blocksize", type=int, default=0)
+    ten_p.add_argument("--nibble-order", choices=("lo_then_hi", "hi_then_lo"), default="lo_then_hi")
+    ten_p.add_argument("--out-prefix", type=Path, default=Path("out/converted"))
+    ten_p.add_argument("--demo", action="store_true")
+    ten_p.add_argument("--json", action="store_true")
+
+    # legacy flags (no subcommand)
+    p.add_argument("--qweight", type=Path)
+    p.add_argument("--absmax", type=Path)
+    p.add_argument("--n-elem", type=int)
+    p.add_argument("--blocksize", type=int, default=64)
+    p.add_argument("--int8-blocksize", type=int, default=0)
+    p.add_argument("--nibble-order", choices=("lo_then_hi", "hi_then_lo"), default="lo_then_hi")
+    p.add_argument("--out-prefix", type=Path, default=Path("out/converted"))
+    p.add_argument("--demo", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    args = p.parse_args(argv)
+    if args.cmd == "pin":
+        from pin_convert import cmd_pin
+
+        return cmd_pin(args)
+    if args.cmd == "tensor":
+        return run_tensor(args)
+    return run_tensor(args)
 
 
 if __name__ == "__main__":

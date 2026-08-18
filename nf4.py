@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import math
 import struct
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 # Measured 16-level table. Same literals as orch nf4_codebook.h.
 NF4_CODEBOOK: Tuple[float, ...] = (
@@ -145,7 +145,7 @@ def quantize_int8_symmetric(
             v = 127
         elif v < -127:
             v = -127
-        q[i] = v & 0xFF  # store as two's complement byte
+        q[i] = v & 0xFF
     return q, scales
 
 
@@ -187,3 +187,45 @@ def pack_f32(vals: Sequence[float]) -> bytes:
 def unpack_f32(buf: bytes) -> List[float]:
     n = len(buf) // 4
     return list(struct.unpack("<" + "f" * n, buf[: n * 4]))
+
+
+def decode_absmax_double(
+    absmax_u8: bytes | bytearray,
+    nested_quant_map: Sequence[float],
+    nested_absmax: Sequence[float],
+    nested_offset: float,
+    nested_blocksize: int = 256,
+) -> List[float]:
+    """L1 absmax from bnb double-quant (R09 D1).
+
+    absmax_fp32[i] = nested_quant_map[absmax_u8[i]] * nested_absmax[i // B] + offset
+    """
+    if nested_blocksize <= 0:
+        raise ValueError("nested_blocksize must be > 0")
+    if len(nested_quant_map) < 256:
+        raise ValueError("nested_quant_map must have 256 levels")
+    out = [0.0] * len(absmax_u8)
+    for i, code in enumerate(absmax_u8):
+        nid = i // nested_blocksize
+        if nid >= len(nested_absmax):
+            raise ValueError(f"nested_absmax short at block {nid}")
+        out[i] = float(nested_quant_map[code]) * float(nested_absmax[nid]) + float(nested_offset)
+    return out
+
+
+def decode_absmax(
+    absmax_raw: bytes | bytearray,
+    *,
+    absmax_is_u8: bool,
+    nested_quant_map: Optional[Sequence[float]] = None,
+    nested_absmax: Optional[Sequence[float]] = None,
+    nested_offset: float = 0.0,
+    nested_blocksize: int = 256,
+) -> List[float]:
+    if not absmax_is_u8:
+        return unpack_f32(bytes(absmax_raw))
+    if nested_quant_map is None or nested_absmax is None:
+        raise ValueError("double-quant absmax needs nested_quant_map + nested_absmax")
+    return decode_absmax_double(
+        absmax_raw, nested_quant_map, nested_absmax, nested_offset, nested_blocksize
+    )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Golden checks. Codebook + roundtrip. Not train_ok."""
+"""Golden checks. Codebook + roundtrip + pin. Not train_ok."""
 from __future__ import annotations
 
 import json
@@ -11,14 +11,18 @@ from pathlib import Path
 from nf4 import (
     NF4_CODEBOOK,
     NIBBLE_LO_THEN_HI,
+    decode_absmax_double,
     dequant_int8,
     dequant_nf4,
     max_abs_err,
+    pack_f32,
     quantize_int8_symmetric,
     quantize_nf4,
     rmse,
 )
 from nf4_to_int8 import convert, demo_weights
+from pin_convert import convert_pin
+from safetensors_io import SafeTensorsFile, write_safetensors
 
 ROOT = Path(__file__).resolve().parent
 
@@ -37,7 +41,6 @@ def test_nf4_roundtrip_zero_and_scale():
     assert am[0] == 0.0
     assert abs(am[1] - 0.5) < 1e-6
     assert max(abs(x) for x in rec[:64]) < 1e-12
-    # 0.5 / 0.5 = 1.0 → code 15
     assert abs(rec[64] - 0.5) < 1e-6
 
 
@@ -46,7 +49,6 @@ def test_int8_zero_point_and_clip():
     q, s = quantize_int8_symmetric(w, blocksize=4)
     rec = dequant_int8(q, s, 4)
     assert s[0] == 2.0 / 127.0
-    # signed view
     signed = [b if b < 128 else b - 256 for b in q]
     assert signed[0] == 0
     assert signed[3] == 127
@@ -60,7 +62,6 @@ def test_convert_rmse_small():
     assert got["meta"]["train_ok"] is False
     assert got["meta"]["rmse_vs_nf4_dequant"] < 0.02
     assert got["meta"]["max_abs_err_vs_nf4_dequant"] < 0.05
-    # recon vs nf4 dequant, not vs original dense
     assert rmse(got["f32"], got["recon"]) == got["meta"]["rmse_vs_nf4_dequant"]
     assert max_abs_err(got["f32"], got["recon"]) == got["meta"]["max_abs_err_vs_nf4_dequant"]
 
@@ -77,7 +78,146 @@ def test_cli_demo():
         meta = json.loads(r.stdout)
         assert meta["n_elem"] == 256
         assert (prefix.with_suffix(".i8.bin")).stat().st_size == 256
-        assert (prefix.with_suffix(".scale.f32.bin")).stat().st_size == 4 * 4  # 256/64
+        assert (prefix.with_suffix(".scale.f32.bin")).stat().st_size == 4 * 4
+
+
+def test_double_quant_offset():
+    # 4 L1 blocks, nested_bs=4 so 1 nested scale
+    nmap = [((i - 127) / 127.0) for i in range(256)]
+    nmap[127] = 0.0
+    codes = bytes([200, 180, 127, 90])
+    nested = [0.04]
+    off = 0.0855
+    am = decode_absmax_double(codes, nmap, nested, off, nested_blocksize=4)
+    assert len(am) == 4
+    assert am[2] == off  # code 127 → 0 * scale + offset
+    assert am[0] > am[3]
+
+
+def _write_single_quant_module(path: Path, stem: str, w: list[float], out_f: int, in_f: int) -> None:
+    qw, am = quantize_nf4(w, blocksize=64)
+    state = json.dumps(
+        {
+            "quant_type": "nf4",
+            "blocksize": 64,
+            "dtype": "bfloat16",
+            "shape": [out_f, in_f],
+            "nested_blocksize": 256,
+            "nested_dtype": "float32",
+            "nested_offset": 0.0,
+        },
+        separators=(",", ":"),
+    ).encode()
+    tensors = [
+        (stem + ".weight", "U8", (len(qw), 1), bytes(qw)),
+        (stem + ".weight.absmax", "F32", (len(am),), pack_f32(am)),
+        (stem + ".weight.quant_map", "F32", (16,), pack_f32(list(NF4_CODEBOOK))),
+        (stem + ".weight.quant_state.bitsandbytes__nf4", "U8", (len(state),), state),
+    ]
+    # BF16-looking passthrough (raw 2 bytes × 4)
+    tensors.append(("model.norm.weight", "BF16", (4,), b"\x00\x3c" * 4))
+    write_safetensors(str(path), tensors, metadata={"format": "pt"})
+
+
+def test_pin_single_quant_roundtrip():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        _write_single_quant_module(src / "model.safetensors", "model.layers.0.mlp.down_proj", w, out_f, in_f)
+        (src / "config.json").write_text(json.dumps({"model_type": "phi3", "hidden_size": 8}) + "\n")
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst, int8_blocksize=64)
+        pin = got["pin"]
+        assert pin["train_ok"] is False
+        assert pin["n_nf4_modules"] == 1
+        assert pin["n_passthrough"] == 1
+        assert pin["rmse_mean"] < 0.02
+        assert (dst / "model.safetensors").is_file()
+        assert (dst / "pin.json").is_file()
+        with SafeTensorsFile(str(dst / "model.safetensors")) as st:
+            assert st.tensors["model.layers.0.mlp.down_proj.weight"].dtype == "I8"
+            assert st.tensors["model.layers.0.mlp.down_proj.weight"].shape == (8, 64)
+            assert "model.norm.weight" in st.tensors
+            assert st.tensors["model.norm.weight"].dtype == "BF16"
+            assert "model.layers.0.mlp.down_proj.weight.absmax" not in st.tensors
+        cfg = json.loads((dst / "config.json").read_text())
+        assert cfg["quantization_config"]["quant_method"] == "nf4_to_int8_pin"
+
+
+def test_cli_pin_dry_run():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "model.safetensors"
+        _write_single_quant_module(src, "lin", w, out_f, in_f)
+        r = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "nf4_to_int8.py"),
+                "pin",
+                "--src",
+                str(src),
+                "--out",
+                str(Path(td) / "unused"),
+                "--dry-run",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        plan = json.loads(r.stdout)
+        assert plan["n_nf4_modules"] == 1
+        assert "lin" in plan["nf4_modules"]
+
+
+def test_double_quant_module_pin():
+    # encode L1 absmax through a fake 256-map so D1 decode is exact enough
+    out_f, in_f = 4, 64
+    w = demo_weights(out_f * in_f)
+    qw, am = quantize_nf4(w, blocksize=64)
+    nmap = [((i - 127) / 127.0) for i in range(256)]
+    nmap[127] = 0.0
+    offset = 0.08
+    # pick codes + nested so decode ≈ am (am is small positive)
+    # am_fp = nmap[c] * nested + offset  →  nmap[c] = (am - offset) / nested
+    nested_val = 0.05
+    codes = bytearray()
+    for a in am:
+        target = (a - offset) / nested_val
+        best = min(range(256), key=lambda i: abs(nmap[i] - target))
+        codes.append(best)
+    state = json.dumps(
+        {
+            "quant_type": "nf4",
+            "blocksize": 64,
+            "dtype": "bfloat16",
+            "shape": [out_f, in_f],
+            "nested_blocksize": 256,
+            "nested_dtype": "float32",
+            "nested_offset": offset,
+        },
+        separators=(",", ":"),
+    ).encode()
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "model.safetensors"
+        write_safetensors(
+            str(src),
+            [
+                ("lin.weight", "U8", (len(qw), 1), bytes(qw)),
+                ("lin.weight.absmax", "U8", (len(codes),), bytes(codes)),
+                ("lin.weight.nested_absmax", "F32", (1,), pack_f32([nested_val])),
+                ("lin.weight.nested_quant_map", "F32", (256,), pack_f32(nmap)),
+                ("lin.weight.quant_map", "F32", (16,), pack_f32(list(NF4_CODEBOOK))),
+                ("lin.weight.quant_state.bitsandbytes__nf4", "U8", (len(state),), state),
+            ],
+        )
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst)
+        assert got["pin"]["n_nf4_modules"] == 1
+        assert got["modules"][0]["double_quant"] == "double"
+        assert got["pin"]["train_ok"] is False
 
 
 if __name__ == "__main__":
@@ -86,4 +226,8 @@ if __name__ == "__main__":
     test_int8_zero_point_and_clip()
     test_convert_rmse_small()
     test_cli_demo()
-    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant cli NOT_train_ok")
+    test_double_quant_offset()
+    test_pin_single_quant_roundtrip()
+    test_cli_pin_dry_run()
+    test_double_quant_module_pin()
+    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin double_quant cli NOT_train_ok")

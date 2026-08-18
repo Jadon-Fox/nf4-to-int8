@@ -1,55 +1,57 @@
 # nf4-to-int8
 
-Turn packed **NF4** (bitsandbytes / Unsloth `bnb-4bit`) into **symmetric INT8**.
-
-This is **dequant then requant**. It is not a dest-pack flip and not a train speedup.
+One-time **NF4 → INT8 pin**. Not a dest-pack flip. Not a train speedup.
 
 ```
-qweight nibble  →  codebook[idx] * absmax[block]  →  f32
-f32             →  clip(round(w / (amax/127)), -127, 127)  →  int8 + per-block scale
+Unsloth / bitsandbytes NF4 safetensors
+        ↓  dequant (16-level codebook, double-quant absmax if present)
+     dense f32
+        ↓  symmetric INT8 per block (amax/127, zp=0)
+INT8 pin directory  (model.safetensors + pin.json)
 ```
 
-Codebook is the 16-level NormalFloat4 table used by bitsandbytes and Unsloth (same literals as orch `nf4_codebook.h`). Default nibble order is **lo then hi**.
+Orch product path stays **NF4-resident** until you load this pin on purpose.
 
-## CLI
+## Pin convert
 
 ```bash
-python3 nf4_to_int8.py --demo
+python3 nf4_to_int8.py pin \
+  --src /path/to/Phi-4-mini-instruct-unsloth-bnb-4bit \
+  --out /path/to/Phi-4-mini-int8-pin
 
-python3 nf4_to_int8.py \
-  --qweight layer.qweight.bin \
-  --absmax  layer.absmax.f32.bin \
-  --n-elem  9437184 \
-  --blocksize 64 \
-  --out-prefix out/layer
+python3 nf4_to_int8.py pin --src model.safetensors --out /tmp/pin --dry-run
 ```
+
+`--src` is a HuggingFace snapshot dir or a single `.safetensors`.
 
 Writes:
 
-| file | contents |
-|------|----------|
-| `*.i8.bin` | `n_elem` bytes, two's-complement int8, zp=0 |
-| `*.scale.f32.bin` | little-endian f32, one scale per INT8 block (`amax/127`) |
-| `*.meta.json` | dims + RMSE vs NF4 dequant. `train_ok: false` |
+| file | role |
+|------|------|
+| `model.safetensors` | `*.weight` **I8 [out,in]**, `*.weight.int8_scale` F32, `*.weight.int8_state` JSON; BF16 norms / skipped MLPs copied |
+| `pin.json` | counts + mean RMSE vs NF4 dequant. `train_ok: false` |
+| `CONVERT_REPORT.json` | per-module RMSE |
+| `config.json` | `quantization_config.quant_method = nf4_to_int8_pin` |
 
-`--int8-blocksize` defaults to the NF4 block size (64). `--nibble-order hi_then_lo` if your packer is inverted.
+Double-quant (Unsloth default): `absmax` is U8 into `nested_quant_map`, then `× nested_absmax[i//256] + nested_offset` (orch R09 D1). Single-quant F32 absmax also works.
+
+Layers left BF16 on the NF4 pin (Phi-4: embed, norms, MLP 1/3/30) stay BF16.
+
+Sharded `model-0000k-of-0000n` is **not** v1 — merge first.
+
+## Single tensor
 
 ```bash
+python3 nf4_to_int8.py --demo
+python3 nf4_to_int8.py tensor --qweight w.nf4.bin --absmax w.absmax.f32.bin --n-elem 4096
 python3 test_nf4_to_int8.py
 ```
 
 ## What this is not
 
-- Not `ORCH_BASE_PACK`. That knob does not exist on the orchestrator.
-- Not an INT8 Tensor-Core GEMM.
-- Not permission to claim the product pin is INT8. The pin stays NF4-resident.
+- Not `ORCH_BASE_PACK`. That knob does not exist.
+- Not an INT8 Tensor-Core GEMM. The pin is storage.
+- Not permission to claim the product pin is INT8. Orch stays NF4-resident.
+- Requant cannot restore bits NF4 already dropped.
 
-Use it when you actually need an INT8 tensor (export, MMA experiment, dump). Expect reconstruction error; the meta file reports RMSE against the NF4 dequant, not against some invented dense original.
-
-## Layout
-
-```
-nf4.py            codebook + dequant + int8 quant
-nf4_to_int8.py    CLI
-test_nf4_to_int8.py
-```
+`train_ok=false`.
