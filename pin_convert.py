@@ -16,10 +16,13 @@ from nf4 import (
     dequant_int8,
     dequant_nf4,
     max_abs_err,
+    pack_bf16,
     pack_f32,
     quantize_int8_symmetric,
     quantize_nf4,
     rmse,
+    unpack_bf16,
+    unpack_f16,
     unpack_f32,
 )
 from safetensors_io import SafeTensorsFile, write_safetensors
@@ -170,6 +173,73 @@ def convert_nf4_module(
     return bytes(q8), scales, meta
 
 
+DENSE_DTYPES = ("BF16", "F16", "F32")
+SKIP_DENSE_SUBSTR = ("embed_tokens", "rotary_emb", ".norm.", "norm.weight")
+
+
+def group_dense_stems(st: SafeTensorsFile) -> Tuple[List[str], List[str]]:
+    """2-D BF16/F16/F32 .weight → INT8 linears. Embed/norms stay passthrough."""
+    linears: List[str] = []
+    passthrough: List[str] = []
+    names = st.names()
+    for name in names:
+        info = st.tensors[name]
+        if not name.endswith(".weight"):
+            passthrough.append(name)
+            continue
+        if any(s in name for s in SKIP_DENSE_SUBSTR):
+            passthrough.append(name)
+            continue
+        if len(info.shape) == 2 and info.dtype in DENSE_DTYPES:
+            linears.append(name[: -len(".weight")])
+        else:
+            passthrough.append(name)
+    return sorted(linears), passthrough
+
+
+def convert_dense_module(
+    st: SafeTensorsFile,
+    stem: str,
+    int8_blocksize: int,
+) -> Tuple[bytes, List[float], dict]:
+    w_name = stem + ".weight"
+    info = st.tensors[w_name]
+    raw = st.read_bytes(w_name)
+    if info.dtype == "BF16":
+        f32 = unpack_bf16(raw)
+        src_dtype = "bf16"
+    elif info.dtype == "F16":
+        f32 = unpack_f16(raw)
+        src_dtype = "f16"
+    elif info.dtype == "F32":
+        f32 = unpack_f32(raw)
+        src_dtype = "f32"
+    else:
+        raise ValueError(f"dense convert refuses dtype={info.dtype} for {w_name}")
+    shape = (int(info.shape[0]), int(info.shape[1]))
+    n_elem = shape[0] * shape[1]
+    if len(f32) != n_elem:
+        raise ValueError(f"{w_name} numel {len(f32)} != {n_elem}")
+    q8, scales = quantize_int8_symmetric(f32, blocksize=int8_blocksize)
+    recon = dequant_int8(q8, scales, int8_blocksize)
+    meta = {
+        "stem": stem,
+        "src_kind": src_dtype,
+        "src_quant": src_dtype,
+        "double_quant": "none",
+        "shape": [shape[0], shape[1]],
+        "n_elem": n_elem,
+        "int8_blocksize": int8_blocksize,
+        "int8_scheme": "symmetric_per_block_zp0",
+        "n_scales": len(scales),
+        "rmse_vs_src": rmse(f32, recon),
+        "max_abs_err_vs_src": max_abs_err(f32, recon),
+        "rmse_vs_nf4_dequant": rmse(f32, recon),
+        "max_abs_err_vs_nf4_dequant": max_abs_err(f32, recon),
+    }
+    return bytes(q8), scales, meta
+
+
 def convert_pin(
     src: Path,
     out_dir: Path,
@@ -184,9 +254,18 @@ def convert_pin(
 
     with SafeTensorsFile(str(weight_path)) as st:
         nf4_stems, passthrough, _consumed = group_modules(st.names())
+        src_kind = "nf4"
+        if not nf4_stems:
+            nf4_stems, passthrough = group_dense_stems(st)
+            src_kind = "bf16"
+            if not nf4_stems:
+                raise ValueError(
+                    "no NF4 modules and no dense 2-D BF16/F16/F32 .weight linears"
+                )
         plan = {
             "schema": "nf4_to_int8_pin_v1",
             "src": str(weight_path),
+            "src_kind": src_kind,
             "n_tensors_in": len(st.tensors),
             "n_nf4_modules": len(nf4_stems),
             "n_passthrough": len(passthrough),
@@ -205,8 +284,9 @@ def convert_pin(
         out_dir.mkdir(parents=True, exist_ok=True)
         out_tensors: List[Tuple[str, str, Tuple[int, ...], bytes]] = []
         reports = []
+        convert_one = convert_nf4_module if src_kind == "nf4" else convert_dense_module
         for stem in nf4_stems:
-            q8, scales, meta = convert_nf4_module(st, stem, int8_blocksize)
+            q8, scales, meta = convert_one(st, stem, int8_blocksize)
             shape = tuple(meta["shape"])
             out_tensors.append((stem + ".weight", "I8", shape, q8))
             out_tensors.append(
@@ -216,7 +296,7 @@ def convert_pin(
                 "quant_type": "int8_symmetric",
                 "blocksize": meta["int8_blocksize"],
                 "shape": list(shape),
-                "src_quant": "nf4",
+                "src_quant": meta.get("src_quant", src_kind),
                 "double_quant": meta["double_quant"],
                 "train_ok": False,
             }
@@ -236,7 +316,7 @@ def convert_pin(
         metadata={
             "format": "pt",
             "quantization": "int8_symmetric_per_block_zp0",
-            "converted_from": "nf4_bnb",
+            "converted_from": "nf4_bnb" if src_kind == "nf4" else "dense_bf16",
             "train_ok": "false",
         },
     )
@@ -244,6 +324,7 @@ def convert_pin(
     pin = {
         "schema": "nf4_to_int8_pin_v1",
         "src": str(weight_path),
+        "src_kind": src_kind,
         "dst": str(out_dir / "model.safetensors"),
         "n_nf4_modules": len(reports),
         "n_passthrough": len(passthrough),
@@ -253,7 +334,9 @@ def convert_pin(
         "max_abs_err_max": max((m["max_abs_err_vs_nf4_dequant"] for m in reports), default=0.0),
         "train_ok": False,
         "measured_omega": False,
-        "note": "static INT8 pin. orch product path remains NF4-resident until this pin is loaded on purpose.",
+        "note": "static INT8 pin from dense BF16/F16/F32"
+        if src_kind != "nf4"
+        else "static INT8 pin. orch product path remains NF4-resident until this pin is loaded on purpose.",
     }
     (out_dir / "pin.json").write_text(json.dumps(pin, indent=2) + "\n")
     (out_dir / "CONVERT_REPORT.json").write_text(
@@ -271,7 +354,7 @@ def convert_pin(
             "load_in_8bit": True,
             "int8_scheme": "symmetric_per_block_zp0",
             "int8_blocksize": int8_blocksize,
-            "converted_from": "bitsandbytes_nf4",
+            "converted_from": "bitsandbytes_nf4" if src_kind == "nf4" else "dense_bf16",
             "train_ok": False,
         }
         (out_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")

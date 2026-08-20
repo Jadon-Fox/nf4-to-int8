@@ -189,6 +189,30 @@ def unpack_f32(buf: bytes) -> List[float]:
     return list(struct.unpack("<" + "f" * n, buf[: n * 4]))
 
 
+def unpack_bf16(buf: bytes) -> List[float]:
+    """IEEE-ish BF16: high 16 bits of F32. LE uint16 per elem."""
+    n = len(buf) // 2
+    out: List[float] = []
+    for i in range(n):
+        h = struct.unpack_from("<H", buf, i * 2)[0]
+        (f,) = struct.unpack("<f", struct.pack("<I", h << 16))
+        out.append(f)
+    return out
+
+
+def unpack_f16(buf: bytes) -> List[float]:
+    n = len(buf) // 2
+    return list(struct.unpack("<" + "e" * n, buf[: n * 2]))
+
+
+def pack_bf16(vals: Sequence[float]) -> bytes:
+    out = bytearray()
+    for v in vals:
+        bits = struct.unpack("<I", struct.pack("<f", float(v)))[0]
+        out.extend(struct.pack("<H", (bits >> 16) & 0xFFFF))
+    return bytes(out)
+
+
 def decode_absmax_double(
     absmax_u8: bytes | bytearray,
     nested_quant_map: Sequence[float],

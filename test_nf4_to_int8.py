@@ -15,10 +15,12 @@ from nf4 import (
     dequant_int8,
     dequant_nf4,
     max_abs_err,
+    pack_bf16,
     pack_f32,
     quantize_int8_symmetric,
     quantize_nf4,
     rmse,
+    unpack_bf16,
 )
 from nf4_to_int8 import convert, demo_weights
 from pin_convert import convert_pin
@@ -146,6 +148,54 @@ def test_pin_single_quant_roundtrip():
         assert cfg["quantization_config"]["quant_method"] == "nf4_to_int8_pin"
 
 
+def test_unpack_bf16_roundtrip():
+    w = [0.0, 1.0, -0.5, 2.0]
+    rec = unpack_bf16(pack_bf16(w))
+    assert abs(rec[0]) < 1e-3
+    assert abs(rec[1] - 1.0) < 0.01
+    assert abs(rec[2] + 0.5) < 0.01
+    assert abs(rec[3] - 2.0) < 0.02
+
+
+def test_pin_bf16_dense_roundtrip():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        write_safetensors(
+            str(src / "model.safetensors"),
+            [
+                (
+                    "model.layers.0.mlp.down_proj.weight",
+                    "BF16",
+                    (out_f, in_f),
+                    pack_bf16(w),
+                ),
+                ("model.embed_tokens.weight", "BF16", (4, 8), pack_bf16([0.1] * 32)),
+                ("model.norm.weight", "BF16", (8,), b"\x00\x3c" * 8),
+            ],
+            metadata={"format": "pt"},
+        )
+        (src / "config.json").write_text(
+            json.dumps({"model_type": "phi3", "architectures": ["Phi3ForCausalLM"]}) + "\n"
+        )
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst, int8_blocksize=64)
+        pin = got["pin"]
+        assert pin["train_ok"] is False
+        assert pin["src_kind"] == "bf16"
+        assert pin["schema"] == "nf4_to_int8_pin_v1"
+        assert pin["n_nf4_modules"] == 1
+        assert pin["n_passthrough"] == 2
+        with SafeTensorsFile(str(dst / "model.safetensors")) as st:
+            assert st.tensors["model.layers.0.mlp.down_proj.weight"].dtype == "I8"
+            assert st.tensors["model.embed_tokens.weight"].dtype == "BF16"
+            assert st.tensors["model.norm.weight"].dtype == "BF16"
+        cfg = json.loads((dst / "config.json").read_text())
+        assert cfg["quantization_config"]["converted_from"] == "dense_bf16"
+
+
 def test_cli_pin_dry_run():
     out_f, in_f = 8, 64
     w = demo_weights(out_f * in_f)
@@ -243,7 +293,9 @@ if __name__ == "__main__":
     test_cli_demo()
     test_double_quant_offset()
     test_pin_single_quant_roundtrip()
+    test_unpack_bf16_roundtrip()
+    test_pin_bf16_dense_roundtrip()
     test_cli_pin_dry_run()
     test_fixture_cli()
     test_double_quant_module_pin()
-    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin double_quant cli NOT_train_ok")
+    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin bf16_dense cli NOT_train_ok")

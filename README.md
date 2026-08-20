@@ -1,6 +1,6 @@
 # nf4-to-int8
 
-One-time **NF4 → INT8 pin**. Not a dest-pack flip. Not a train speedup.
+One-time **NF4 or dense BF16/F16/F32 → INT8 pin**. Not a dest-pack flip. Not a train speedup.
 
 ```
 Unsloth / bitsandbytes NF4 safetensors
@@ -8,7 +8,13 @@ Unsloth / bitsandbytes NF4 safetensors
      dense f32
         ↓  symmetric INT8 per block (amax/127, zp=0)
 INT8 pin directory  (model.safetensors + pin.json)
+
+Dense BF16 / F16 / F32 safetensors (no bnb aux)
+        ↓  unpack → f32 → same INT8 block quant
+INT8 pin  pin.json src_kind=bf16
 ```
+
+Product dest should be the **dense** path (`src_kind=bf16`). NF4→INT8 is a double-quant leftover.
 
 Orch product path stays **NF4-resident** until you load this pin on purpose.
 
