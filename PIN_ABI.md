@@ -1,8 +1,28 @@
 # INT8 pin ABI v1
 
-Default source is **dense BF16/F16**. `--to int8` writes this schema (orch L0 loader). `--to nf4` writes `bf16_to_nf4_pin_v1` (packed NF4 + F32 absmax, single quant, not Unsloth DQ).
+Default source is **dense BF16/F16**. Dest:
 
-NF4 sources are HARD_BLOCK without `--allow-requant`.
+| `--to` | schema | orch |
+|---|---|---|
+| `int8` | `nf4_to_int8_pin_v1` | INT8 pin loader L0 |
+| `nf4` | `bf16_to_nf4_pin_v1` | fit, owned NF4 |
+| `nested-nf8` | `nested_nf8_pin_v1` | hole=NF4 nibble, plug=4-bit sub-cell. `w=NF8_CELLS[h][p]*absmax` |
+
+NF4 sources are HARD_BLOCK without `--allow-requant`. `nested-nf8` **never** from NF4 (no within-cell bits).
+
+## nested_nf8_pin_v1
+
+Per linear:
+
+- `{stem}.weight` U8 packed hole (NF4 nibbles, lo-then-hi)
+- `{stem}.weight.nf8_plug` U8 packed plug (4-bit sub-index)
+- `{stem}.weight.absmax` F32
+- `{stem}.weight.quant_map` F32 16 (parent NF4 table)
+- `{stem}.weight.nested_state` JSON
+- `_nf8_cells` F32 [16,16] once per file (SSOT also `include/nf8_cells.h`)
+
+L0 expand at load. L1 H-TILE: `cp.async` hole + plug, lookup `NF8_CELLS[hole][plug]`. CUDA. `train_ok=false`.
+
 
 
 ## Directory

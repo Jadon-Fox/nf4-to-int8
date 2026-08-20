@@ -19,6 +19,8 @@ from nf4 import (
     quantize_int8_symmetric,
     quantize_nf4,
     rmse,
+    unpack_f32,
+    unpack_indices,
 )
 from nf4_to_int8 import convert, demo_weights
 from dtype_io import pack_bf16, unpack_bf16
@@ -345,6 +347,39 @@ def test_bf16_to_nf4_pin():
             assert st.tensors["model.norm.weight"].dtype == "BF16"
 
 
+def test_nested_nf8_pin():
+    from nested_nf import encode_nested
+
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    w_src = unpack_bf16(pack_bf16(w))
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        write_safetensors(
+            str(src / "model.safetensors"),
+            [
+                ("lin.weight", "BF16", (out_f, in_f), pack_bf16(w)),
+                ("model.norm.weight", "BF16", (8,), pack_bf16([1.0] * 8)),
+            ],
+        )
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst, policy=Policy(dest="nested-nf8", dense="quantize"))
+        pin = got["pin"]
+        assert pin["schema"] == "nested_nf8_pin_v1"
+        assert pin["dest"] == "nested-nf8"
+        assert pin["n_converted"] == 1
+        with SafeTensorsFile(str(dst / "model.safetensors")) as st:
+            assert "lin.weight.nf8_plug" in st.tensors
+            assert "_nf8_cells" in st.tensors
+            assert st.tensors["_nf8_cells"].shape == (16, 16)
+            hole = unpack_indices(st.read_bytes("lin.weight"), out_f * in_f)
+            plug = unpack_indices(st.read_bytes("lin.weight.nf8_plug"), out_f * in_f)
+            nf4i, pl, _am = encode_nested(w_src, 64)
+            assert hole == nf4i
+            assert plug == pl
+
+
 if __name__ == "__main__":
     test_codebook_ends()
     test_nf4_roundtrip_zero_and_scale()
@@ -362,4 +397,5 @@ if __name__ == "__main__":
     test_refuse_gptq()
     test_refuse_nf4_without_allow_requant()
     test_bf16_to_nf4_pin()
-    print("TEST_NF4_TO_INT8_GREEN bf16_to_int8 bf16_to_nf4 refuse_requant NOT_train_ok")
+    test_nested_nf8_pin()
+    print("TEST_NF4_TO_INT8_GREEN bf16_to_int8 bf16_to_nf4 nested_nf8 refuse_requant NOT_train_ok")

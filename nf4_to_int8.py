@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     pin_p = sub.add_parser("pin", help="one-hop convert: dense BF16/F16/F32 → INT8 or NF4 pin")
     pin_p.add_argument("--src", required=True, help="HF model dir or model.safetensors (BF16/F16)")
     pin_p.add_argument("--out", required=True, help="output pin directory")
-    pin_p.add_argument("--to", choices=("int8", "nf4"), default="int8", help="dest pin. default int8")
+    pin_p.add_argument("--to", choices=("int8", "nf4", "nested-nf8"), default="int8", help="dest pin. default int8")
     pin_p.add_argument("--int8-blocksize", type=int, default=64, help="block size for INT8 or NF4")
     pin_p.add_argument("--dry-run", action="store_true")
     pin_p.add_argument(

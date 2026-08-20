@@ -9,6 +9,10 @@ python3 nf4_to_int8.py pin --src /path/to/phi-4-mini-bf16 --out /path/to/int8-pi
 # fit case: same source → NF4 pin
 python3 nf4_to_int8.py pin --src /path/to/phi-4-mini-bf16 --out /path/to/nf4-pin --to nf4
 
+# nested NF8: keep the 16 Gaussian cells, plug = sub-index (orch H-TILE L0/L1)
+python3 nf4_to_int8.py pin --src /path/to/phi-4-mini-bf16 --out /path/to/nested-nf8 --to nested-nf8
+
+
 python3 nf4_to_int8.py pin --src model.safetensors --out /tmp/pin --dry-run
 ```
 

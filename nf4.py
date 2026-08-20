@@ -55,6 +55,30 @@ def pack_nibbles(first: int, second: int, nibble_order: int) -> int:
     return second | (first << 4)
 
 
+def pack_indices(
+    idx: Sequence[int],
+    nibble_order: int = NIBBLE_LO_THEN_HI,
+) -> bytearray:
+    n = len(idx)
+    packed = bytearray(qweight_nbytes(n))
+    for i in range(0, n, 2):
+        first = int(idx[i]) & 0x0F
+        second = int(idx[i + 1]) & 0x0F if i + 1 < n else 0
+        packed[i // 2] = pack_nibbles(first, second, nibble_order)
+    return packed
+
+
+def unpack_indices(
+    packed: bytes | bytearray,
+    n_elem: int,
+    nibble_order: int = NIBBLE_LO_THEN_HI,
+) -> List[int]:
+    out = [0] * n_elem
+    for i in range(n_elem):
+        out[i] = extract_nibble(packed[i // 2], i & 1, nibble_order)
+    return out
+
+
 def nearest_code(v: float) -> int:
     best = 0
     best_d = abs(v - NF4_CODEBOOK[0])
