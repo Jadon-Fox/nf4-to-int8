@@ -122,11 +122,29 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="NF4 → INT8 (offline pin or single tensor)")
     sub = p.add_subparsers(dest="cmd")
 
-    pin_p = sub.add_parser("pin", help="convert a bnb/Unsloth NF4 safetensors dir into an INT8 pin")
+    pin_p = sub.add_parser("pin", help="convert NF4 / BF16 / F16 / F32 safetensors into an INT8 pin")
     pin_p.add_argument("--src", required=True, help="model dir or model.safetensors")
     pin_p.add_argument("--out", required=True, help="output pin directory")
     pin_p.add_argument("--int8-blocksize", type=int, default=64)
     pin_p.add_argument("--dry-run", action="store_true")
+    pin_p.add_argument(
+        "--dense",
+        choices=("int8", "copy"),
+        default="int8",
+        help="BF16/F16/F32 linears (full-prec ckpt or skipped MLPs). default int8",
+    )
+    pin_p.add_argument(
+        "--embed",
+        choices=("copy", "int8"),
+        default="copy",
+        help="token embeddings / lm_head. default copy (keep BF16)",
+    )
+    pin_p.add_argument(
+        "--linears",
+        choices=("int8",),
+        default="int8",
+        help="bnb NF4/FP4 linears. always int8 in v1",
+    )
 
     fix_p = sub.add_parser("fixture", help="write a tiny 8x64 INT8 pin for orch loader CI")
     fix_p.add_argument("--out", required=True, help="directory; writes _src/ and int8_pin/")

@@ -1,59 +1,59 @@
 # nf4-to-int8
 
-One-time **NF4 → INT8 pin**. Not a dest-pack flip. Not a train speedup.
+Drop a model in. Write a static **INT8 pin**. Offline, once.
 
 ```
-Unsloth / bitsandbytes NF4 safetensors
-        ↓  dequant (16-level codebook, double-quant absmax if present)
-     dense f32
-        ↓  symmetric INT8 per block (amax/127, zp=0)
-INT8 pin directory  (model.safetensors + pin.json)
+NF4 (bnb / Unsloth, ± double-quant)
+FP4 with on-disk 16-level map
+BF16 / F16 / F32 dense linears
+        ↓
+INT8 pin  (I8 + per-block scale, zp=0)
+norms / biases copied
+embeddings copied (optional --embed int8)
 ```
 
-Orch product path stays **NF4-resident** until you load this pin on purpose.
+Not a dest-pack flip. Not a train speedup. Ampere still unfolds to f32/f16 for GEMM.
 
-## Pin convert
+## Convert
 
 ```bash
+# Unsloth / bitsandbytes 4-bit (Phi-4 Mini etc.)
 python3 nf4_to_int8.py pin \
   --src /path/to/Phi-4-mini-instruct-unsloth-bnb-4bit \
-  --out /path/to/Phi-4-mini-int8-pin
+  --out /path/to/int8-pin
+
+# Full-prec BF16/FP16 checkpoint — linears → INT8, norms stay BF16
+python3 nf4_to_int8.py pin --src /path/to/bf16-model --out /path/to/int8-pin --dense int8
+
+# Hybrid Unsloth pin: NF4 linears + skipped BF16 MLPs both become INT8
+python3 nf4_to_int8.py pin --src /path/to/bnb-4bit --out /path/to/int8-pin --dense int8
 
 python3 nf4_to_int8.py pin --src model.safetensors --out /tmp/pin --dry-run
-python3 nf4_to_int8.py fixture --out /tmp/tiny-pin   # 8×64 pin for orch loader CI
-
+python3 nf4_to_int8.py fixture --out /tmp/tiny-pin
 ```
 
-`--src` is a HuggingFace snapshot dir or a single `.safetensors`.
+| flag | default | meaning |
+|------|---------|---------|
+| `--dense` | `int8` | leftover BF16/F16/F32 **linears** (16-bit ckpt, or Unsloth skipped MLP 1/3/30) |
+| `--embed` | `copy` | token embeddings / lm_head stay high prec |
+| `--linears` | `int8` | bnb NF4/FP4 linears |
+| (norms) | always `copy` | RMSNorm / LayerNorm / bias / rotary never INT8 |
 
-Writes:
+GPTQ, AWQ, GGUF, sharded `model-0000k-of-*`: **refuse** (not v1). Merge / convert those first.
 
-| file | role |
-|------|------|
-| `model.safetensors` | `*.weight` **I8 [out,in]**, `*.weight.int8_scale` F32, `*.weight.int8_state` JSON; BF16 norms / skipped MLPs copied |
-| `pin.json` | counts + mean RMSE vs NF4 dequant. `train_ok: false` |
-| `CONVERT_REPORT.json` | per-module RMSE |
-| `config.json` | `quantization_config.quant_method = nf4_to_int8_pin` |
+Writes `model.safetensors` + `pin.json` (`schema: nf4_to_int8_pin_v1` — orch loader ABI unchanged) + `CONVERT_REPORT.json`.
 
-Double-quant (Unsloth default): `absmax` is U8 into `nested_quant_map`, then `× nested_absmax[i//256] + nested_offset` (orch R09 D1). Single-quant F32 absmax also works.
+## Footprint vs unfold (why INT8 is not always the move)
 
-Layers left BF16 on the NF4 pin (Phi-4: embed, norms, MLP 1/3/30) stay BF16.
+Unfold = dequant to f32/f16, then GEMM. Ampere (3060) **trains** in TF32/FP16/BF16, not INT8 MMA.
 
-Sharded `model-0000k-of-0000n` is **not** v1 — merge first.
+| storage | bits/weight | unfold accuracy | fits a bigger frozen base on 12 GB |
+|--------|-------------|-----------------|--------------------------------------|
+| **NF4** | ~4.1 | 16 codebook levels. QLoRA default. | **yes — smallest** |
+| **INT8** (this pin) | ~8.1 | 255 uniform levels. Better unfold than NF4 if you started from BF16. | middle |
+| **BF16/FP16** | 16 | native | no, for 3B+ + LoRA + KV |
+| GPTQ/AWQ INT4 | ~4 | similar 4-bit, different error | yes — **not this converter** |
 
-## Single tensor
-
-```bash
-python3 nf4_to_int8.py --demo
-python3 nf4_to_int8.py tensor --qweight w.nf4.bin --absmax w.absmax.f32.bin --n-elem 4096
-python3 test_nf4_to_int8.py
-```
-
-## What this is not
-
-- Not `ORCH_BASE_PACK`. That knob does not exist.
-- Not an INT8 Tensor-Core GEMM. The pin is storage.
-- Not permission to claim the product pin is INT8. Orch stays NF4-resident.
-- Requant cannot restore bits NF4 already dropped.
+INT8 is the **quality/size middle** for unfold, not the smallest. If the goal is “larger model on a 3060,” keep **NF4** (or GPTQ) as storage. If the goal is “more accurate unfold than NF4, still tighter than BF16,” this pin.
 
 `train_ok=false`.

@@ -27,7 +27,27 @@ Seals: `train_ok=false` · `measured_omega=false` · not product NF4 path.
 }
 ```
 
-Refuse the pin if `schema` ≠ `nf4_to_int8_pin_v1`.
+Loader still requires `schema=nf4_to_int8_pin_v1`. Extra keys are informational:
+
+```json
+{
+  "schema": "nf4_to_int8_pin_v1",
+  "n_nf4_modules": 122,
+  "n_dense_modules": 6,
+  "n_converted": 128,
+  "n_passthrough": 72,
+  "src_kinds": ["nf4", "bf16"],
+  "policy": {"linears": "int8", "dense": "int8", "embed": "copy", "norm": "copy"},
+  "int8_blocksize": 64,
+  "int8_scheme": "symmetric_per_block_zp0",
+  "train_ok": false
+}
+```
+
+`src_quant` in each `int8_state` may be `nf4`, `fp4`, `bf16`, `f16`, or `f32`. Dequant formula is the same.
+
+**Always copied (never INT8):** RMSNorm, LayerNorm, bias, rotary `inv_freq`.
+
 
 ## Per converted linear (was NF4)
 

@@ -21,7 +21,8 @@ from nf4 import (
     rmse,
 )
 from nf4_to_int8 import convert, demo_weights
-from pin_convert import convert_pin
+from dtype_io import pack_bf16, unpack_bf16
+from pin_convert import Policy, convert_pin
 from safetensors_io import SafeTensorsFile, write_safetensors
 
 ROOT = Path(__file__).resolve().parent
@@ -235,6 +236,75 @@ def test_double_quant_module_pin():
         assert got["pin"]["train_ok"] is False
 
 
+def test_bf16_roundtrip_bits():
+    vals = [0.0, 1.0, -0.5, 0.25]
+    rec = unpack_bf16(pack_bf16(vals))
+    for a, b in zip(vals, rec):
+        assert abs(a - b) < 1e-2
+
+
+def test_dense_bf16_pin():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        write_safetensors(
+            str(src / "model.safetensors"),
+            [
+                ("model.layers.0.mlp.down_proj.weight", "BF16", (out_f, in_f), pack_bf16(w)),
+                ("model.layers.0.mlp.gate_up_proj.weight", "BF16", (out_f, in_f), pack_bf16(w)),
+                ("model.embed_tokens.weight", "BF16", (32, in_f), pack_bf16(demo_weights(32 * in_f))),
+                ("model.norm.weight", "BF16", (8,), pack_bf16([1.0] * 8)),
+            ],
+        )
+        (src / "config.json").write_text(json.dumps({"model_type": "phi3"}) + "\n")
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst, policy=Policy(dense="int8", embed="copy"))
+        pin = got["pin"]
+        assert pin["n_dense_modules"] == 2
+        assert pin["n_nf4_modules"] == 0
+        assert "bf16" in pin["src_kinds"]
+        with SafeTensorsFile(str(dst / "model.safetensors")) as st:
+            assert st.tensors["model.layers.0.mlp.down_proj.weight"].dtype == "I8"
+            assert st.tensors["model.embed_tokens.weight"].dtype == "BF16"
+            assert st.tensors["model.norm.weight"].dtype == "BF16"
+
+
+def test_dense_copy_policy():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "model.safetensors"
+        write_safetensors(
+            str(src),
+            [("lin.weight", "BF16", (out_f, in_f), pack_bf16(w))],
+        )
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst, policy=Policy(dense="copy"))
+        with SafeTensorsFile(str(dst / "model.safetensors")) as st:
+            assert st.tensors["lin.weight"].dtype == "BF16"
+        assert got["pin"]["n_dense_modules"] == 0
+
+
+def test_refuse_gptq():
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "model.safetensors"
+        write_safetensors(
+            str(src),
+            [
+                ("lin.qweight", "I32", (8,), b"\x00" * 32),
+                ("lin.qzeros", "I32", (2,), b"\x00" * 8),
+            ],
+        )
+        try:
+            convert_pin(src, Path(td) / "pin")
+        except ValueError as e:
+            assert "HARD_BLOCK" in str(e)
+        else:
+            raise AssertionError("expected GPTQ refuse")
+
+
 if __name__ == "__main__":
     test_codebook_ends()
     test_nf4_roundtrip_zero_and_scale()
@@ -246,4 +316,8 @@ if __name__ == "__main__":
     test_cli_pin_dry_run()
     test_fixture_cli()
     test_double_quant_module_pin()
-    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin double_quant cli NOT_train_ok")
+    test_bf16_roundtrip_bits()
+    test_dense_bf16_pin()
+    test_dense_copy_policy()
+    test_refuse_gptq()
+    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin double_quant dense_bf16 cli NOT_train_ok")

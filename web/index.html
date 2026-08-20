@@ -34,14 +34,15 @@
 </head>
 <body>
   <main>
-    <h1>NF4 → INT8 pin</h1>
-    <p class="lede">One-time snapshot convert. Dequant bitsandbytes / Unsloth NF4 (including double-quant absmax), write a static INT8 pin. Not a mid-step dest-pack flip.</p>
-    <p class="warn">Orch hot path stays NF4-resident until this pin is loaded on purpose. train_ok stays false.</p>
+    <h1>NF4 / BF16 → INT8 pin</h1>
+    <p class="lede">Drop in Unsloth NF4, a BF16 checkpoint, or a hybrid (skipped MLPs). Offline convert to a static INT8 pin. Norms stay high precision. Not a mid-step dest-pack flip.</p>
+    <p class="warn">INT8 is the unfold/quality middle, not the smallest. Ampere still dequants to f32/f16 for GEMM. train_ok stays false.</p>
     <div class="card" style="margin-bottom:14px">
       <h2>Command</h2>
       <pre>python3 nf4_to_int8.py pin \
-  --src /path/to/unsloth-bnb-4bit \
-  --out /path/to/int8-pin</pre>
+  --src /path/to/model \
+  --out /path/to/int8-pin \
+  --dense int8 --embed copy</pre>
     </div>
     <div class="row">
       <section class="card">

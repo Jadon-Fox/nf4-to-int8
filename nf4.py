@@ -72,9 +72,13 @@ def dequant_nf4(
     n_elem: int,
     blocksize: int = 64,
     nibble_order: int = NIBBLE_LO_THEN_HI,
+    codebook: Sequence[float] | None = None,
 ) -> List[float]:
     if blocksize <= 0:
         raise ValueError("blocksize must be > 0")
+    cb = codebook if codebook is not None else NF4_CODEBOOK
+    if len(cb) != 16:
+        raise ValueError("4-bit codebook must have 16 levels")
     need_q = qweight_nbytes(n_elem)
     need_a = n_absmax(n_elem, blocksize)
     if len(qweight) < need_q:
@@ -86,7 +90,7 @@ def dequant_nf4(
         b = qweight[i // 2]
         idx = extract_nibble(b, i & 1, nibble_order)
         scale = float(absmax[i // blocksize])
-        out[i] = NF4_CODEBOOK[idx] * scale
+        out[i] = float(cb[idx]) * scale
     return out
 
 
