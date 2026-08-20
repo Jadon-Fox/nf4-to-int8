@@ -119,31 +119,31 @@ def run_tensor(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    p = argparse.ArgumentParser(description="NF4 → INT8 (offline pin or single tensor)")
+    p = argparse.ArgumentParser(description="BF16/F16 → INT8 or NF4 pin (one hop)")
     sub = p.add_subparsers(dest="cmd")
 
-    pin_p = sub.add_parser("pin", help="convert NF4 / BF16 / F16 / F32 safetensors into an INT8 pin")
-    pin_p.add_argument("--src", required=True, help="model dir or model.safetensors")
+    pin_p = sub.add_parser("pin", help="one-hop convert: dense BF16/F16/F32 → INT8 or NF4 pin")
+    pin_p.add_argument("--src", required=True, help="HF model dir or model.safetensors (BF16/F16)")
     pin_p.add_argument("--out", required=True, help="output pin directory")
-    pin_p.add_argument("--int8-blocksize", type=int, default=64)
+    pin_p.add_argument("--to", choices=("int8", "nf4"), default="int8", help="dest pin. default int8")
+    pin_p.add_argument("--int8-blocksize", type=int, default=64, help="block size for INT8 or NF4")
     pin_p.add_argument("--dry-run", action="store_true")
     pin_p.add_argument(
+        "--allow-requant",
+        action="store_true",
+        help="permit NF4/FP4 sources (lossy second hop). off by default",
+    )
+    pin_p.add_argument(
         "--dense",
-        choices=("int8", "copy"),
-        default="int8",
-        help="BF16/F16/F32 linears (full-prec ckpt or skipped MLPs). default int8",
+        choices=("quantize", "copy", "int8"),
+        default="quantize",
+        help="16-bit linears. default quantize to --to",
     )
     pin_p.add_argument(
         "--embed",
-        choices=("copy", "int8"),
+        choices=("copy", "quantize", "int8"),
         default="copy",
-        help="token embeddings / lm_head. default copy (keep BF16)",
-    )
-    pin_p.add_argument(
-        "--linears",
-        choices=("int8",),
-        default="int8",
-        help="bnb NF4/FP4 linears. always int8 in v1",
+        help="token embeddings / lm_head. default copy",
     )
 
     fix_p = sub.add_parser("fixture", help="write a tiny 8x64 INT8 pin for orch loader CI")

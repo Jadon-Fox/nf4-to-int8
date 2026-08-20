@@ -129,7 +129,7 @@ def test_pin_single_quant_roundtrip():
         _write_single_quant_module(src / "model.safetensors", "model.layers.0.mlp.down_proj", w, out_f, in_f)
         (src / "config.json").write_text(json.dumps({"model_type": "phi3", "hidden_size": 8}) + "\n")
         dst = Path(td) / "pin"
-        got = convert_pin(src, dst, int8_blocksize=64)
+        got = convert_pin(src, dst, int8_blocksize=64, policy=Policy(allow_requant=True))
         pin = got["pin"]
         assert pin["train_ok"] is False
         assert pin["n_nf4_modules"] == 1
@@ -163,6 +163,7 @@ def test_cli_pin_dry_run():
                 "--out",
                 str(Path(td) / "unused"),
                 "--dry-run",
+                "--allow-requant",
             ],
             check=True,
             capture_output=True,
@@ -230,7 +231,7 @@ def test_double_quant_module_pin():
             ],
         )
         dst = Path(td) / "pin"
-        got = convert_pin(src, dst)
+        got = convert_pin(src, dst, policy=Policy(allow_requant=True))
         assert got["pin"]["n_nf4_modules"] == 1
         assert got["modules"][0]["double_quant"] == "double"
         assert got["pin"]["train_ok"] is False
@@ -305,6 +306,45 @@ def test_refuse_gptq():
             raise AssertionError("expected GPTQ refuse")
 
 
+def test_refuse_nf4_without_allow_requant():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "model.safetensors"
+        _write_single_quant_module(src, "lin", w, out_f, in_f)
+        try:
+            convert_pin(src, Path(td) / "pin")
+        except ValueError as e:
+            assert "already NF4" in str(e)
+        else:
+            raise AssertionError("expected NF4 refuse")
+
+
+def test_bf16_to_nf4_pin():
+    out_f, in_f = 8, 64
+    w = demo_weights(out_f * in_f)
+    with tempfile.TemporaryDirectory() as td:
+        src = Path(td) / "src"
+        src.mkdir()
+        write_safetensors(
+            str(src / "model.safetensors"),
+            [
+                ("lin.weight", "BF16", (out_f, in_f), pack_bf16(w)),
+                ("model.norm.weight", "BF16", (8,), pack_bf16([1.0] * 8)),
+            ],
+        )
+        dst = Path(td) / "pin"
+        got = convert_pin(src, dst, policy=Policy(dest="nf4", dense="quantize"))
+        pin = got["pin"]
+        assert pin["schema"] == "bf16_to_nf4_pin_v1"
+        assert pin["dest"] == "nf4"
+        assert pin["n_converted"] == 1
+        with SafeTensorsFile(str(dst / "model.safetensors")) as st:
+            assert st.tensors["lin.weight"].dtype == "U8"
+            assert "lin.weight.absmax" in st.tensors
+            assert st.tensors["model.norm.weight"].dtype == "BF16"
+
+
 if __name__ == "__main__":
     test_codebook_ends()
     test_nf4_roundtrip_zero_and_scale()
@@ -320,4 +360,6 @@ if __name__ == "__main__":
     test_dense_bf16_pin()
     test_dense_copy_policy()
     test_refuse_gptq()
-    print("TEST_NF4_TO_INT8_GREEN codebook dequant requant pin double_quant dense_bf16 cli NOT_train_ok")
+    test_refuse_nf4_without_allow_requant()
+    test_bf16_to_nf4_pin()
+    print("TEST_NF4_TO_INT8_GREEN bf16_to_int8 bf16_to_nf4 refuse_requant NOT_train_ok")

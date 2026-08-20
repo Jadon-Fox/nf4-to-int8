@@ -1,7 +1,9 @@
 # INT8 pin ABI v1
 
-Contract for an orch **loader**. Produced by `nf4_to_int8.py pin`.  
-Seals: `train_ok=false` · `measured_omega=false` · not product NF4 path.
+Default source is **dense BF16/F16**. `--to int8` writes this schema (orch L0 loader). `--to nf4` writes `bf16_to_nf4_pin_v1` (packed NF4 + F32 absmax, single quant, not Unsloth DQ).
+
+NF4 sources are HARD_BLOCK without `--allow-requant`.
+
 
 ## Directory
 

@@ -24,6 +24,7 @@ from nf4 import (
     pack_f32,
     quantize_int8_symmetric,
     quantize_nf4,
+    qweight_nbytes,
     rmse,
     unpack_f32,
 )
@@ -87,10 +88,17 @@ DENSE_DTYPES = ("BF16", "F16", "F32")
 
 @dataclass
 class Policy:
-    linears: str = "int8"  # int8 | copy
-    dense: str = "int8"  # leftover BF16/F16/F32 linears (skipped MLPs, 16-bit ckpts)
-    embed: str = "copy"  # int8 | copy
+    dest: str = "int8"  # int8 | nf4
+    allow_requant: bool = False  # NF4/GPTQ already quantized → refuse unless set
+    dense: str = "quantize"  # quantize | copy  (16-bit linears)
+    embed: str = "copy"  # copy | quantize
     # norms always copy
+
+
+def _dest_schema(dest: str) -> str:
+    if dest == "nf4":
+        return "bf16_to_nf4_pin_v1"
+    return "nf4_to_int8_pin_v1"  # orch INT8 loader ABI
 
 
 def find_weight_file(src: Path) -> Path:
@@ -336,6 +344,64 @@ def _append_int8(
     out_tensors.append((stem + ".weight.int8_state", "U8", (len(raw_state),), raw_state))
 
 
+def convert_dense_to_nf4(
+    st: SafeTensorsFile,
+    name: str,
+    blocksize: int,
+) -> Tuple[bytes, List[float], dict]:
+    info = st.tensors[name]
+    raw = st.read_bytes(name)
+    f32 = unpack_dense(info.dtype, raw, info.shape)
+    n_elem = numel_of(info.shape)
+    f32 = f32[:n_elem]
+    packed, absmax = quantize_nf4(f32, blocksize=blocksize)
+    recon = dequant_nf4(packed, absmax, n_elem, blocksize)
+    stem = name[: -len(".weight")] if name.endswith(".weight") else name
+    shape = tuple(int(x) for x in info.shape)
+    meta = {
+        "src": stem,
+        "src_quant": info.dtype.lower(),
+        "dst_quant": "nf4",
+        "double_quant": "none",
+        "shape": [int(shape[0]), int(shape[1])] if len(shape) == 2 else list(shape),
+        "n_elem": n_elem,
+        "nf4_blocksize": blocksize,
+        "int8_blocksize": 0,
+        "n_scales": len(absmax),
+        "rmse_vs_src_dequant": rmse(f32, recon),
+        "max_abs_err_vs_src_dequant": max_abs_err(f32, recon),
+    }
+    return bytes(packed), absmax, meta
+
+
+def _append_nf4(
+    out_tensors: list,
+    stem: str,
+    shape: Tuple[int, ...],
+    packed: bytes,
+    absmax: List[float],
+    meta: dict,
+) -> None:
+    out_tensors.append((stem + ".weight", "U8", (len(packed), 1), packed))
+    out_tensors.append((stem + ".weight.absmax", "F32", (len(absmax),), pack_f32(absmax)))
+    out_tensors.append((stem + ".weight.quant_map", "F32", (16,), pack_f32(list(NF4_CODEBOOK))))
+    state = {
+        "quant_type": "nf4",
+        "blocksize": meta["nf4_blocksize"],
+        "dtype": "bfloat16",
+        "shape": list(shape),
+        "nested_blocksize": 256,
+        "nested_dtype": "float32",
+        "nested_offset": 0.0,
+        "src_quant": meta["src_quant"],
+        "train_ok": False,
+    }
+    raw_state = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    out_tensors.append(
+        (stem + ".weight.quant_state.bitsandbytes__nf4", "U8", (len(raw_state),), raw_state)
+    )
+
+
 def convert_pin(
     src: Path,
     out_dir: Path,
@@ -356,6 +422,12 @@ def convert_pin(
             raise ValueError("HARD_BLOCK: " + "; ".join(refused))
 
         nf4_stems, rest, _consumed = group_modules(st.names())
+        if nf4_stems and not policy.allow_requant:
+            raise ValueError(
+                "HARD_BLOCK: source is already NF4/FP4. Download BF16/F16 and convert once. "
+                "Requant (NF4→INT8) needs --allow-requant. That cannot restore lost bits."
+            )
+
         dense_linears = []
         embeds = []
         keep = []
@@ -371,8 +443,14 @@ def convert_pin(
             else:
                 other.append(name)
 
+        dest = policy.dest
+        if dest not in ("int8", "nf4"):
+            raise ValueError(f"dest must be int8 or nf4, got {dest}")
+        dense_q = policy.dense in ("int8", "nf4", "quantize")
+        embed_q = policy.embed in ("int8", "nf4", "quantize")
+
         plan = {
-            "schema": "nf4_to_int8_pin_v1",
+            "schema": _dest_schema(dest),
             "src": str(weight_path),
             "n_tensors_in": len(st.tensors),
             "n_nf4_modules": len(nf4_stems),
@@ -380,16 +458,16 @@ def convert_pin(
             "n_embed": len(embeds),
             "n_keep": len(keep),
             "policy": {
-                "linears": policy.linears,
-                "dense": policy.dense,
-                "embed": policy.embed,
+                "dest": dest,
+                "allow_requant": policy.allow_requant,
+                "dense": "quantize" if dense_q else "copy",
+                "embed": "quantize" if embed_q else "copy",
                 "norm": "copy",
             },
-            "int8_blocksize": int8_blocksize,
-            "int8_scheme": "symmetric_per_block_zp0",
+            "blocksize": int8_blocksize,
             "train_ok": False,
             "measured_omega": False,
-            "note": "offline pin convert. not dest-pack flip. not orch hot path.",
+            "note": "one hop from BF16/F16/F32. not dest-pack. not orch hot path.",
         }
         if dry_run:
             plan["nf4_modules"] = nf4_stems
@@ -405,23 +483,46 @@ def convert_pin(
         n_copied = 0
         src_kinds = set()
 
-        if policy.linears == "int8":
-            for stem in nf4_stems:
-                q8, scales, meta = convert_nf4_module(st, stem, int8_blocksize)
-                _append_int8(out_tensors, stem, tuple(meta["shape"]), q8, scales, meta)
-                reports.append(meta)
-                src_kinds.add(meta["src_quant"])
-        else:
-            raise ValueError("policy.linears=copy with NF4 sources is refuse (would emit packed NF4)")
-
-        if policy.dense == "int8":
-            for name in dense_linears:
-                q8, scales, meta = convert_dense_module(st, name, int8_blocksize)
-                stem = name[: -len(".weight")]
+        def emit_quant(name_or_stem: str, is_dense_tensor: bool) -> None:
+            nonlocal n_copied
+            if is_dense_tensor:
+                name = name_or_stem
+                stem = name[: -len(".weight")] if name.endswith(".weight") else name
                 shape = tuple(int(x) for x in st.tensors[name].shape)
-                _append_int8(out_tensors, stem, shape, q8, scales, meta)
+                if dest == "int8":
+                    q8, scales, meta = convert_dense_module(st, name, int8_blocksize)
+                    _append_int8(out_tensors, stem, shape, q8, scales, meta)
+                else:
+                    packed, absmax, meta = convert_dense_to_nf4(st, name, int8_blocksize or 64)
+                    _append_nf4(out_tensors, stem, shape, packed, absmax, meta)
                 reports.append(meta)
                 src_kinds.add(meta["src_quant"])
+            else:
+                stem = name_or_stem
+                if dest == "int8":
+                    q8, scales, meta = convert_nf4_module(st, stem, int8_blocksize)
+                    _append_int8(out_tensors, stem, tuple(meta["shape"]), q8, scales, meta)
+                    reports.append(meta)
+                    src_kinds.add(meta["src_quant"])
+                else:
+                    # already NF4, dest NF4: copy, don't requant
+                    w = stem + ".weight"
+                    info = st.tensors[w]
+                    out_tensors.append((w, info.dtype, info.shape, st.read_bytes(w)))
+                    for suf in NF4_SUFFIXES:
+                        aux = stem + suf
+                        if aux in st.tensors:
+                            a = st.tensors[aux]
+                            out_tensors.append((aux, a.dtype, a.shape, st.read_bytes(aux)))
+                    n_copied += 1
+                    src_kinds.add("nf4_copy")
+
+        for stem in nf4_stems:
+            emit_quant(stem, False)
+
+        if dense_q:
+            for name in dense_linears:
+                emit_quant(name, True)
         else:
             for name in dense_linears:
                 info = st.tensors[name]
@@ -429,18 +530,11 @@ def convert_pin(
                 n_copied += 1
                 src_kinds.add(info.dtype.lower() + "_copy")
 
-        embed_names = embeds
-        if policy.embed == "int8":
-            for name in embed_names:
-                info = st.tensors[name]
-                q8, scales, meta = convert_dense_module(st, name, int8_blocksize)
-                stem = name[: -len(".weight")] if name.endswith(".weight") else name
-                shape = tuple(int(x) for x in info.shape)
-                _append_int8(out_tensors, stem, shape, q8, scales, meta)
-                reports.append(meta)
-                src_kinds.add("embed_" + meta["src_quant"])
+        if embed_q:
+            for name in embeds:
+                emit_quant(name, True)
         else:
-            for name in embed_names:
+            for name in embeds:
                 info = st.tensors[name]
                 out_tensors.append((name, info.dtype, info.shape, st.read_bytes(name)))
                 n_copied += 1
@@ -450,13 +544,14 @@ def convert_pin(
             out_tensors.append((name, info.dtype, info.shape, st.read_bytes(name)))
             n_copied += 1
 
+    qtag = "nf4_owned_single_quant" if dest == "nf4" else "int8_symmetric_per_block_zp0"
     write_safetensors(
         str(out_dir / "model.safetensors"),
         out_tensors,
         metadata={
             "format": "pt",
-            "quantization": "int8_symmetric_per_block_zp0",
-            "converted_from": ",".join(sorted(src_kinds)) or "mixed",
+            "quantization": qtag,
+            "converted_from": ",".join(sorted(src_kinds)) or "bf16",
             "train_ok": "false",
         },
     )
@@ -467,22 +562,24 @@ def convert_pin(
         for m in reports
     ]
     pin = {
-        "schema": "nf4_to_int8_pin_v1",
+        "schema": _dest_schema(dest),
         "src": str(weight_path),
         "dst": str(out_dir / "model.safetensors"),
+        "dest": dest,
         "n_nf4_modules": len(nf4_stems),
-        "n_dense_modules": len(dense_linears) if policy.dense == "int8" else 0,
+        "n_dense_modules": len(dense_linears) if dense_q else 0,
         "n_converted": len(reports),
         "n_passthrough": n_copied,
         "src_kinds": sorted(src_kinds),
         "policy": plan["policy"],
-        "int8_blocksize": int8_blocksize,
-        "int8_scheme": "symmetric_per_block_zp0",
+        "int8_blocksize": int8_blocksize if dest == "int8" else 0,
+        "nf4_blocksize": int8_blocksize if dest == "nf4" else 0,
+        "int8_scheme": "symmetric_per_block_zp0" if dest == "int8" else None,
         "rmse_mean": (sum(rmses) / len(rmses)) if rmses else 0.0,
         "max_abs_err_max": max(maxes) if maxes else 0.0,
         "train_ok": False,
         "measured_omega": False,
-        "note": "static INT8 pin. norms copied. Ampere train still dequants to f32/f16 for GEMM.",
+        "note": "one hop from dense BF16/F16/F32. Ampere train still GEMMs in f16/f32.",
     }
     (out_dir / "pin.json").write_text(json.dumps(pin, indent=2) + "\n")
     (out_dir / "CONVERT_REPORT.json").write_text(
@@ -554,16 +651,28 @@ def write_tiny_fixture(out_dir: Path) -> dict:
         metadata={"format": "pt"},
     )
     (src / "config.json").write_text(json.dumps({"model_type": "phi3", "hidden_size": 8}) + "\n")
-    return convert_pin(src, out_dir / "int8_pin", int8_blocksize=64)
+    return convert_pin(
+        src,
+        out_dir / "int8_pin",
+        int8_blocksize=64,
+        policy=Policy(dest="int8", allow_requant=True, dense="quantize"),
+    )
 
 
 def cmd_pin(args: Any) -> int:
     src = Path(args.src)
     out = Path(args.out)
+    dense = getattr(args, "dense", "quantize")
+    if dense == "int8":
+        dense = "quantize"
+    embed = getattr(args, "embed", "copy")
+    if embed == "int8":
+        embed = "quantize"
     policy = Policy(
-        linears=getattr(args, "linears", "int8"),
-        dense=getattr(args, "dense", "int8"),
-        embed=getattr(args, "embed", "copy"),
+        dest=getattr(args, "to", "int8"),
+        allow_requant=bool(getattr(args, "allow_requant", False)),
+        dense=dense,
+        embed=embed,
     )
     got = convert_pin(
         src,
